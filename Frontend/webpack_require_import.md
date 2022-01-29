@@ -4,52 +4,98 @@
 
 ### 背景
 
-首先介绍一些问题的背景：老项目基于 koa bff 层和 handlerbar 模板。大致的渲染逻辑如下：
+首先介绍一些问题的背景：老项目基于 koa bff 层和 handlerbar 模板（具体可以参考 [Handlebars 首页](https://www.handlebarsjs.cn/)）开发，与 html 模板不同的是，handlebars 模板中书写有特定的 mustache 语法，可以方便 server 进行一些变量的提前注入。老项目大致的渲染路径为：
 
-1. 访问 index 路由时候，koa bff server 会对 handlerbar 模板进行简单处理，并返回给前端；
-2. 
+1. 用户访问页面路由时候，bff server 层通过 mustache 语法对 handlebars 模板进行变量注入后，转换成 html 模板返回；
+2. 浏览器侧，React 通过客户端渲染，完成页面的渲染和展示。
 
-由于 bff 层和前端模板耦合在一起，因此每次发布都需要整体的对 bff 层进行发布，流程耗时较长，而且不方便灰度。为了减少发布耗时，同时利用 Goofy 快捷的灰度功能，因此，决定将项目从原来的模板渲染形式改成纯 html 模板渲染的方式。但是在改造的过程中，我们碰到了如下的问题：
+由于 bff 层和前端模板耦合在一起，因此每次发布都需要整体的对 bff 层和前端代码同时发布，流程耗时较长。为了减少发布耗时，经过讨论后决定将项目从原来的 bff server + handlebars 模板渲染形式改成 html 普通模板前后端分离的模式——**bff server 层只提供 api 接口，渲染过程由 react + html 模板完成**。然而在改造的过程中，我们碰到了一个比较棘手的问题：**原先通过 Mustache 语法注入的全局变量如何获取？**
 
-原项目中，用户信息和环境信息的一些变量，是直接在模板中注入到 window 全局变量中的；
+老项目中，一些“用户信息”和“环境信息”这样可以提前获取的变量，是直接通过 handlebars 模板在 bff server 渲染中直接注入到 window 全局变量中的，如下图所示：
 
+![handlebars 模板示例](https://raw.githubusercontent.com/wujc16/tech-blogs/main/Frontend/images/handlebars.jpeg)
 
-在迁移 Goofy 的过程中，由于改成了普通的 HTML 模板，因此无法直接在 window 中注入全局变量，我们大致的的思路是：
-
-1. 使用 fetch 的方式，在渲染之前完成“用户信息”和“环境信息”等的获取；
-2. 获取成功后，写入到 window 全局变量中。
-
-这样写完后，代码大概长下面这样：
-```JavaScript
-
-```
-
-但是，在使用过程中，我们发现了，由于原来采用 handlerbar 模版的方式，拿到 html 文件的时候就已经执行了 window 全局对象的注入，所以在很多文件中（类似 ``@utils/env``）会有如下的写法：
+解决这一问题，我们大致的的思路是：**在 bff server 提供获取相关信息的 API 接口，客户端渲染前，使用 fetch 的方式获取信息并注入到 window 中，获取成功后再进行渲染。** 大致的伪代码如下：
 
 ```JavaScript
-const isBoe = window.__isBoe;
+import React from 'react';
+import ReactDom from 'react-dom';
+import { apiGet } from '@utils/api';
 
-export function getEnv() {
-    return isBoe ? 'boe' : 'prod';
-}
+import App from './App';
+
+apiGet('/api/profile').then(res => {
+  // 首先进行 api 获取和全局变量的注入
+  const { isProd, userId } = res.data;
+  window._is_prod = isProd;
+  window._user_id = userId;
+
+  // 注入成功后渲染
+  ReactDom.render(<App />, document.querySelector('#root'));
+});
 ```
 
-这些文件由于，直接在
+经过上面的改写后，运行过程中，确实是按照我们设想的流程运行，然而控制台这个时候却提示了很多 ``undefined`` 的相关报错，经过分析我们发现如下的问题。
 
-为了解决这一问题，有以下两个思路：
+假如我们有一个 ``@utils/env.ts`` 文件，内部定义了 ``getEnv`` 函数来获取当前的环境，那么根据写法的不同，可能会导致不同的结果：
 
-1. 全局查找类似 ``const isBoe = window.__isBoe``  这样的赋值语句，改成下面的形式，这样在实际的运行时，从 window 对象里面取到的值也是最新值！
+1. 如果代码按照如下形式书写，那么在渲染和后续的事件响应过程中调用，由于 ``window._is_prod`` 已经赋值，不会出现问题；
 
     ```JavaScript
     export function getEnv() {
-        return window.__isBoe ? 'boe' : 'prod';
+      return window._is_prod ? 'prod' : 'dev';
     }
     ```
-2. Block import 语句的执行，在 fetch 成功并且往 window 对象里面注入
+2. 而如果采用如下的形式定义，``const isProd = window._is_prod`` 在其他文件 ``import`` 当前文件时就已经运行，此时接口还没获取数据，从而导致后面函数通过闭包访问到的 ``isProd`` 值为 ```undefined`。
 
-然而由于。
+    ```JavaScript
+    const isProd = window._is_prod;
 
-实际上，到这一步，我们遇到的问题其实就已经解决了。然而
+    export function getEnv() {
+        return isProd ? 'prod' : 'dev';
+    }
+    ```
+
+可以发现，导致上面两种不同结果的本质原因是：**获取 window 中变量的时机不同所导致的。** 因此，即使将 React 的渲染时机推迟到接口获取成功之后，由于很多代码会在 ``import`` 执行时就开始获取 ``window`` 中的数据，因此没有办法避免上述 ``undefined`` 问题的出现。
+
+为了解决这一问题，有以下两个思路：
+
+1. 全局查找类似 ``const isProd = window._is_prod`` 这样的赋值语句，将对 ``isProd`` 的访问改成对 ``window._is_prod`` 的访问，这样在实际的运行时，从 ``window`` 对象里面取到的值也是最新值；
+2. 通过某种机制，使得 ``import`` 语句在接口获取成功之后执行，从而保证 ``const isProd = window._is_prod`` 执行是，``window`` 内的变量已经更新。
+
+第一个思路相对简单，然而存在隐患：由于项目很大，需要改动的地方很多，非常容易出现遗漏，导致出现线上 BUG。
+
+因此考虑基于第二种思路来解决问题。在代码中，所有的模块引入都是使用``import``关键词，然而按照规范，``import``是“编译时”调用，要将组件和模块的引入阻塞到接口获取成功之后，需要实现“运行时”调用，而符合这一要求的只有符合 Commonjs 规范的``require``关键词，因此考虑使用``require``进行模块引用。
+
+最后，我们采用了一种比较 tricky 的方式，原先的 webpack 入口文件 src/index.js 保持不变，代码为：
+```js
+import React from 'react';
+import ReactDom from 'react-dom';
+
+import App from './App';
+
+ReactDom.render(<App />, document.querySelector('#root'));
+```
+
+然后新建 ``src/new-index.js`` 文件，代码：
+```JavaScript
+import { apiGet } from '@utils/api';
+
+apiGet('/api/profile').then(res => {
+  // 首先进行 api 获取和全局变量的注入
+  const { isProd, userId } = res.data;
+  window._is_prod = isProd;
+  window._user_id = userId;
+
+  require('./index');
+});
+```
+
+并且在 webpack 中将 entry 文件从 ``src/index.js`` 改成 ``src/new-index.js`` 即可。
+
+到这一步，我们遇到的问题其实就已经解决了。然而我们更深一步思考，其实会有：
+
+``import``实际是 ES6 的语法标准，即使是支持该特性的浏览器，也必须在 ``script`` 标签中通过添加 ``type="module"``，而 ``require`` 关键词更是 node 环境下的 Commonjs 标准，那么问题来了：**Webpack 分别是怎么处理 require 和 import 关键词，使得编译后的 Js 文件既能在浏览器环境下执行，又满足了**。
 
 ## 模块
 
